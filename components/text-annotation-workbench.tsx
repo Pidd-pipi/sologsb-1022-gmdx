@@ -37,6 +37,7 @@ import {
   Search,
   Trash2,
   Undo2,
+  Upload,
   Wifi,
   WifiOff
 } from 'lucide-react';
@@ -55,6 +56,15 @@ import {
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  MERGE_STORAGE_KEY,
+  confirmationDocument,
+  createConfirmation,
+  mergeDrafts,
+  parseDraftFile,
+  resolveConfirmationItem
+} from '@/lib/merge';
+import type { MergeConfirmation, MergePendingItem } from '@/lib/merge';
 import type {
   Annotation,
   AnnotationKind,
@@ -340,7 +350,15 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [confirmation, setConfirmation] = useState<MergeConfirmation | null>(null);
+  const [mergeError, setMergeError] = useState('');
+  const [baseSnapshotId, setBaseSnapshotId] = useState('snapshot-base');
+  const [remoteChanged, setRemoteChanged] = useState(false);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const mergeFileRef = useRef<HTMLInputElement | null>(null);
+  const tabBaseRef = useRef<WorkspaceState | null>(null);
+  const lastWrittenRef = useRef<string>('');
+  const remoteChangedRef = useRef(false);
 
   const workspace = state.workspace;
   const document = workspace.document;
@@ -366,7 +384,14 @@ export function TextAnnotationWorkbench() {
         if (stored.document?.chapters?.length) {
           dispatch({ type: 'hydrate', workspace: stored });
           if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
+          tabBaseRef.current = clone(stored);
+          lastWrittenRef.current = stored.document.updatedAt;
         }
+      }
+      const mergeRaw = localStorage.getItem(MERGE_STORAGE_KEY);
+      if (mergeRaw) {
+        const storedConfirmation = JSON.parse(mergeRaw) as MergeConfirmation;
+        if (storedConfirmation?.original?.chapters?.length) setConfirmation(storedConfirmation);
       }
     } catch {
       setApiMessage('离线草稿损坏，已载入模拟数据');
@@ -375,11 +400,53 @@ export function TextAnnotationWorkbench() {
     setOnline(navigator.onLine);
   }, []);
 
+  // 多标签页：其他标签页写入同一底本时，本方暂停自动保存并提示重载
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== STORAGE_KEY || !event.newValue) return;
+      try {
+        const stored = JSON.parse(event.newValue) as WorkspaceState;
+        if (stored.document?.updatedAt && stored.document.updatedAt !== lastWrittenRef.current) {
+          remoteChangedRef.current = true;
+          setRemoteChanged(true);
+        }
+      } catch {
+        // 忽略无法解析的写入
+      }
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, []);
+
+  function writeWorkspace(next: WorkspaceState, reason: string): boolean {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const stored = JSON.parse(raw) as WorkspaceState;
+        if (stored.document?.updatedAt && stored.document.updatedAt !== lastWrittenRef.current) {
+          // 另一个标签页已保存：保留对方修改，提示重载，不用本方旧稿覆盖
+          remoteChangedRef.current = true;
+          setRemoteChanged(true);
+          setApiMessage('检测到另一标签页已保存修改，已暂停写入并保留对方内容，请重载页面。');
+          return false;
+        }
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      lastWrittenRef.current = next.document.updatedAt;
+      setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
+      setApiMessage(`${reason}已写入本地，模拟接口返回 200`);
+      return true;
+    } catch {
+      setApiMessage('写入本地失败，草稿仍保留在当前会话中。');
+      return false;
+    }
+  }
+
   useEffect(() => {
     if (!hydrated) return;
     const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
-      setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
+      if (remoteChangedRef.current) return; // 另一标签页已写入，避让并提示重载
+      writeWorkspace(workspace, '自动保存');
     }, 450);
     return () => window.clearTimeout(timer);
   }, [hydrated, workspace]);
@@ -466,9 +533,9 @@ export function TextAnnotationWorkbench() {
   async function persistSnapshot(reason: string) {
     setApiMessage('正在调用模拟保存接口…');
     await new Promise((resolve) => window.setTimeout(resolve, 380));
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
-    setApiMessage(`${reason}已写入本地，模拟接口返回 200`);
-    setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
+    if (writeWorkspace(workspace, reason)) {
+      setApiMessage(`${reason}已写入本地，模拟接口返回 200`);
+    }
   }
 
   function addAnnotation(values: Omit<Annotation, 'id' | 'status' | 'conflictState' | 'updatedAt'>) {
@@ -620,6 +687,88 @@ export function TextAnnotationWorkbench() {
     download(`${document.title}.json`, JSON.stringify(document, null, 2), 'application/json;charset=utf-8');
   }
 
+  // ---------- 离线合并草稿 ----------
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      if (confirmation) localStorage.setItem(MERGE_STORAGE_KEY, JSON.stringify(confirmation));
+      else localStorage.removeItem(MERGE_STORAGE_KEY);
+    } catch {
+      // 确认结果过大时仅保存在会话内
+    }
+  }, [hydrated, confirmation]);
+
+  async function handleMergeFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const remote = parseDraftFile(await file.text());
+      const localSnapshot = document.snapshots.find((item) => item.id === baseSnapshotId) ?? document.snapshots[0];
+      if (!localSnapshot) throw new Error('缺少校订快照作为合并底本');
+      // 优先采用对方草稿中同一快照的内容，保证底本一致
+      const remoteSnapshot = remote.snapshots?.find((item) => item.id === localSnapshot.id);
+      const baseSnapshotData = remoteSnapshot ?? localSnapshot;
+      const base: TextDocument = {
+        ...clone(document),
+        chapters: clone(baseSnapshotData.chapters),
+        annotations: clone(baseSnapshotData.annotations)
+      };
+      const result = mergeDrafts(base, document, remote);
+      setConfirmation(createConfirmation(localSnapshot.id, document, result.document, result.pending, result.migrations));
+      setMergeError('');
+      setRightTab('versions');
+    } catch (error) {
+      // 合并失败：原草稿与既有待处理项保持不变
+      setMergeError(`合并失败：${(error as Error).message}。已恢复原草稿与待处理项，可更换文件后重试。`);
+    }
+  }
+
+  function updateResolution(itemId: string, resolution: MergePendingItem['resolution']) {
+    setConfirmation((current) => (current ? resolveConfirmationItem(current, itemId, resolution) : current));
+  }
+
+  function applyMerge() {
+    if (!confirmation) return;
+    const finalDocument = confirmationDocument(confirmation);
+    dispatch({
+      type: 'commit',
+      label: '合并两校草稿并写入当前稿',
+      mutate: (doc) => {
+        doc.chapters = clone(finalDocument.chapters);
+        doc.annotations = clone(finalDocument.annotations);
+        doc.snapshots = clone(finalDocument.snapshots);
+      }
+    });
+    setConfirmation(null);
+    setApiMessage('合并结果已写入当前草稿。');
+  }
+
+  function restoreMerge() {
+    if (!confirmation) return;
+    dispatch({
+      type: 'commit',
+      label: '放弃合并，恢复原草稿',
+      mutate: (doc) => {
+        doc.chapters = clone(confirmation.original.chapters);
+        doc.annotations = clone(confirmation.original.annotations);
+        doc.snapshots = clone(confirmation.original.snapshots);
+      }
+    });
+    setApiMessage('已恢复合并前的原草稿，待处理项保留，可重新选择文件合并。');
+  }
+
+  function exportMerged() {
+    if (!confirmation) return;
+    const merged = confirmationDocument(confirmation);
+    download(`${merged.title}-合并结果.json`, JSON.stringify(merged, null, 2), 'application/json;charset=utf-8');
+  }
+
+  function reloadAfterConflict() {
+    window.location.reload();
+  }
+
   function exportHtml() {
     download(`${document.title}.html`, buildHtml(document), 'text/html;charset=utf-8');
   }
@@ -692,6 +841,18 @@ export function TextAnnotationWorkbench() {
           </span>
         </div>
       </header>
+
+      {remoteChanged ? (
+        <div className="mx-auto max-w-[1800px] px-4 pt-4 lg:px-6">
+          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span>另一个标签页已保存同一旧底本；为避免覆盖，本方暂停写入并保留了对方修改。</span>
+            <Button size="sm" color="warning" className="ml-auto" onPress={reloadAfterConflict}>
+              重新载入
+            </Button>
+          </div>
+        </div>
+      ) : null}
 
       <main className="mx-auto grid max-w-[1800px] grid-cols-1 gap-4 p-4 lg:grid-cols-[270px_minmax(0,1fr)_390px] lg:p-6">
         <aside className="space-y-4 no-print">
@@ -1020,6 +1181,162 @@ export function TextAnnotationWorkbench() {
                         <Button className="mt-2 w-full" size="sm" color="primary" variant="flat" onPress={saveVersion} startContent={<Save className="h-4 w-4" />}>
                           保存当前版本
                         </Button>
+                      </div>
+
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="flex items-center gap-2 font-semibold text-stone-900"><Upload className="h-4 w-4" />离线合并草稿</h3>
+                        <p className="mt-2 text-[11px] leading-5 text-stone-500">
+                          导入另一台机器导出的草稿 JSON，以校订快照为底本重新定位句子与词语。唯一对上的注释沿用，原词消失则迁到句子；两边都改或互见关系不同的注释并列保留，选择后再写入当前稿。
+                        </p>
+                        <Select
+                          className="mt-3"
+                          aria-label="合并底本快照"
+                          label="校订快照（共同底本）"
+                          size="sm"
+                          selectedKeys={new Set([baseSnapshotId])}
+                          onSelectionChange={(keys) => setBaseSnapshotId(String(Array.from(keys)[0]))}
+                        >
+                          {document.snapshots.map((snapshot) => <SelectItem key={snapshot.id}>{snapshot.label}</SelectItem>)}
+                        </Select>
+                        <input
+                          ref={mergeFileRef}
+                          type="file"
+                          accept="application/json,.json"
+                          className="hidden"
+                          onChange={(event) => void handleMergeFile(event)}
+                        />
+                        <Button
+                          className="mt-2 w-full"
+                          size="sm"
+                          color="primary"
+                          variant="flat"
+                          startContent={<Upload className="h-4 w-4" />}
+                          onPress={() => mergeFileRef.current?.click()}
+                        >
+                          选择对方草稿文件合并
+                        </Button>
+                        {mergeError ? <p className="mt-2 rounded-lg bg-red-50 p-2 text-[11px] leading-5 text-red-700">{mergeError}</p> : null}
+
+                        {confirmation ? (
+                          <div className="mt-3 space-y-3 border-t border-stone-100 pt-3">
+                            <div className="flex flex-wrap gap-1.5">
+                              <Chip size="sm" variant="flat" color="success">{confirmationDocument(confirmation).annotations.length} 条注释待写入</Chip>
+                              <Chip size="sm" variant="flat">{confirmation.migrations.length} 条迁到句子</Chip>
+                              <Chip size="sm" variant={confirmation.pending.some((item) => item.resolution === 'both') ? 'flat' : 'solid'} color="warning">
+                                {confirmation.pending.length} 处待选择
+                              </Chip>
+                            </div>
+
+                            {confirmation.migrations.length ? (
+                              <div className="rounded-lg bg-stone-50 p-2">
+                                <div className="text-[11px] font-semibold text-stone-700">词语重新定位</div>
+                                {confirmation.migrations.map((migration) => (
+                                  <p key={migration.annotationId} className="mt-1 text-[11px] leading-4 text-stone-500">
+                                    《{migration.annotationTitle}》{migration.fromType === 'word' ? '词语' : '句子'} → {migration.toType === 'sentence' ? '句子' : '章节'}：{migration.detail}
+                                  </p>
+                                ))}
+                              </div>
+                            ) : null}
+
+                            {confirmation.pending.map((item) => (
+                              <div key={item.id} className="rounded-lg border border-amber-200 bg-amber-50/60 p-2">
+                                <div className="flex items-center gap-2">
+                                  <Chip size="sm" color="warning" variant="flat">
+                                    {item.kind === 'annotation' ? '注释待选' : '句子正文待选'}
+                                  </Chip>
+                                  <span className="text-[11px] text-stone-500">
+                                    {item.reason === 'both-modified'
+                                      ? '两边都做了修改'
+                                      : item.reason === 'crossref-differs'
+                                        ? '互见关系不同'
+                                        : item.reason === 'delete-modify'
+                                          ? '一方删除、一方修改'
+                                          : item.reason === 'both-added'
+                                            ? '两边新增且内容不同'
+                                            : '两边正文修改不同'}
+                                  </span>
+                                </div>
+                                {item.kind === 'annotation' ? (
+                                  <div className="mt-2 space-y-2">
+                                    {([
+                                      { key: 'local' as const, label: '我方稿', data: item.local },
+                                      { key: 'remote' as const, label: '对方稿', data: item.remote }
+                                    ]).filter((option) => option.data).map((option) => (
+                                      <label
+                                        key={option.key}
+                                        className={`block cursor-pointer rounded-lg border p-2 ${
+                                          item.resolution === option.key ? 'border-amber-400 bg-white' : 'border-stone-200 bg-white/60'
+                                        }`}
+                                      >
+                                        <input
+                                          type="radio"
+                                          name={item.id}
+                                          className="mr-2 align-middle"
+                                          checked={item.resolution === option.key}
+                                          onChange={() => updateResolution(item.id, option.key)}
+                                        />
+                                        <span className="text-[11px] font-semibold text-stone-700">{option.label}</span>
+                                        <span className="ml-2 text-[11px] text-stone-500">{option.data?.source}</span>
+                                        <span className="mt-1 block text-[11px] font-medium text-stone-800">{option.data?.title}</span>
+                                        <span className="mt-0.5 block text-[11px] leading-4 text-stone-600">{option.data?.body}</span>
+                                        {option.data?.references.length ? (
+                                          <span className="mt-1 block text-[10px] text-stone-400">互见：{option.data.references.join('、')}</span>
+                                        ) : null}
+                                      </label>
+                                    ))}
+                                    <label
+                                      className={`block cursor-pointer rounded-lg border p-2 ${
+                                        item.resolution === 'both' ? 'border-amber-400 bg-white' : 'border-stone-200 bg-white/60'
+                                      }`}
+                                    >
+                                      <input
+                                        type="radio"
+                                        name={item.id}
+                                        className="mr-2 align-middle"
+                                        checked={item.resolution === 'both'}
+                                        onChange={() => updateResolution(item.id, 'both')}
+                                      />
+                                      <span className="text-[11px] font-semibold text-stone-700">两条并列保留，稍后在冲突中处理</span>
+                                    </label>
+                                  </div>
+                                ) : (
+                                  <div className="mt-2 space-y-2">
+                                    {([
+                                      { key: 'local' as const, label: '我方稿', text: item.localText },
+                                      { key: 'remote' as const, label: '对方稿', text: item.remoteText }
+                                    ]).map((option) => (
+                                      <label
+                                        key={option.key}
+                                        className={`block cursor-pointer rounded-lg border p-2 ${
+                                          item.resolution === option.key ? 'border-amber-400 bg-white' : 'border-stone-200 bg-white/60'
+                                        }`}
+                                      >
+                                        <input
+                                          type="radio"
+                                          name={item.id}
+                                          className="mr-2 align-middle"
+                                          checked={item.resolution === option.key}
+                                          onChange={() => updateResolution(item.id, option.key)}
+                                        />
+                                        <span className="text-[11px] font-semibold text-stone-700">{option.label}</span>
+                                        <span className="mt-1 block font-serif text-[12px] leading-5 text-stone-700">
+                                          {option.text ?? '（删除该句）'}
+                                        </span>
+                                      </label>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+
+                            <div className="grid grid-cols-3 gap-2">
+                              <Button size="sm" color="primary" onPress={applyMerge}>写入当前稿</Button>
+                              <Button size="sm" variant="flat" onPress={restoreMerge}>恢复原稿</Button>
+                              <Button size="sm" variant="flat" startContent={<FileDown className="h-3.5 w-3.5" />} onPress={exportMerged}>导出结果</Button>
+                            </div>
+                            <p className="text-[10px] leading-4 text-stone-400">写入、恢复与导出均读取同一份确认结果；恢复原稿后待处理项保留，可重新合并。</p>
+                          </div>
+                        ) : null}
                       </div>
 
                       <div className="grid grid-cols-2 gap-2">
