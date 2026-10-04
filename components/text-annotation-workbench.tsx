@@ -26,6 +26,7 @@ import {
   FileDown,
   FileJson,
   GitCompareArrows,
+  GitMerge,
   Keyboard,
   Link2,
   ListTree,
@@ -33,6 +34,7 @@ import {
   Plus,
   Printer,
   Redo2,
+  RefreshCw,
   Save,
   Search,
   Trash2,
@@ -41,9 +43,9 @@ import {
   WifiOff
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { annotationKindLabels, anchorTypeLabels, initialDocument, tokenizeText } from '@/lib/data';
+import { MergePanel } from '@/components/merge-panel';
+import { initialDocument, tokenizeText, annotationKindLabels, anchorTypeLabels } from '@/lib/data';
 import {
-  STORAGE_KEY,
   clone,
   collectSearchResults,
   createInitialEditorState,
@@ -53,13 +55,35 @@ import {
   getTargetLabel,
   kindLabel,
   removeAnnotationReferences,
+  toWorkspace,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  MergeValidationError,
+  autoResolutionsForTabSync,
+  buildMergePlan,
+  createConfirmedMerge,
+  finalizeMerge
+} from '@/lib/merge';
+import {
+  DRAFT_KEY,
+  LEGACY_DRAFT_KEY,
+  readConfirmed,
+  readEnvelope,
+  readReview,
+  writeConfirmed,
+  writeEnvelope,
+  writeReview
+} from '@/lib/storage';
 import type {
   Annotation,
   AnnotationKind,
   AnchorType,
+  ConfirmedMerge,
   ConflictGroup,
+  MergePlan,
+  MergeResolution,
+  MergeReview,
   Sentence,
   TextDocument,
   ViewMode,
@@ -340,9 +364,18 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [mergeReview, setMergeReview] = useState<MergeReview | null>(null);
+  const [confirmedMerge, setConfirmedMergeState] = useState<ConfirmedMerge | null>(null);
+  const [mergeNotice, setMergeNotice] = useState('');
+  const [remoteNotice, setRemoteNotice] = useState('');
+  const revisionRef = useRef(0);
+  const workspaceRef = useRef<WorkspaceState | null>(null);
+  const reviewRef = useRef<MergeReview | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
+  workspaceRef.current = workspace;
+  reviewRef.current = mergeReview;
   const document = workspace.document;
   const selectedChapter =
     document.chapters.find((chapter) => chapter.id === workspace.selectedChapterId) ?? document.chapters[0];
@@ -360,29 +393,54 @@ export function TextAnnotationWorkbench() {
 
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const stored = JSON.parse(raw) as WorkspaceState;
-        if (stored.document?.chapters?.length) {
-          dispatch({ type: 'hydrate', workspace: stored });
-          if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
-        }
+      const { envelope, legacy } = readEnvelope();
+      const stored = envelope?.workspace ?? legacy ?? null;
+      if (stored?.document?.chapters?.length) {
+        dispatch({ type: 'hydrate', workspace: stored });
+        revisionRef.current = envelope?.revision ?? 0;
+        if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
       }
     } catch {
       setApiMessage('离线草稿损坏，已载入模拟数据');
     }
+    setMergeReview(readReview());
+    setConfirmedMergeState(readConfirmed());
     setHydrated(true);
     setOnline(navigator.onLine);
   }, []);
 
+  // 静默自动保存：只在没有别的标签页抢先保存时写入；revision 落后则交给“合并并保存”
   useEffect(() => {
     if (!hydrated) return;
     const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
+      const current = workspaceRef.current;
+      if (!current) return;
+      const remote = readEnvelope().envelope;
+      if (remote && remote.revision !== revisionRef.current) {
+        setRemoteNotice('另一个标签页已保存新内容，自动保存已暂停；请点“合并并重载”保留两边修改。');
+        return;
+      }
+      const revision = (remote?.revision ?? revisionRef.current) + 1;
+      writeEnvelope(current, revision);
+      revisionRef.current = revision;
       setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
     }, 450);
     return () => window.clearTimeout(timer);
   }, [hydrated, workspace]);
+
+  // 监听其他标签页的保存：提示重载（后保存者负责合并两边修改）
+  useEffect(() => {
+    function onStorage(event: StorageEvent) {
+      if (event.key !== DRAFT_KEY && event.key !== LEGACY_DRAFT_KEY) return;
+      const remote = readEnvelope().envelope;
+      if (!remote) return;
+      if (remote.revision > revisionRef.current) {
+        setRemoteNotice('另一个标签页保存了同一旧底本。点“合并并重载”可保留对方修改并自动合并本机改动。');
+      }
+    }
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   useEffect(() => {
     const handleOnline = () => setOnline(true);
@@ -463,12 +521,166 @@ export function TextAnnotationWorkbench() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [document, moveToNextAnnotation, selectedSentence, workspace.selectedAnnotationId]);
 
-  async function persistSnapshot(reason: string) {
+  /**
+   * 保存：若 revision 落后于另一个标签页，则以共同快照做一次三向合并，
+   * 后保存的保留对方修改；句子冲突取对方版本、注释冲突并列保留进待处理项。
+   */
+  async function persistSnapshot(reason: string, localWorkspace: WorkspaceState = workspaceRef.current!) {
     setApiMessage('正在调用模拟保存接口…');
     await new Promise((resolve) => window.setTimeout(resolve, 380));
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
+    const remote = readEnvelope().envelope;
+
+    if (remote && remote.revision !== revisionRef.current) {
+      try {
+        const sharedIds = new Set(remote.workspace.document.snapshots.map((snapshot) => snapshot.id));
+        const baseSnapshot =
+          [...localWorkspace.document.snapshots].reverse().find((snapshot) => sharedIds.has(snapshot.id))
+          ?? localWorkspace.document.snapshots[0];
+        if (!baseSnapshot) throw new MergeValidationError('两边缺少共同校订快照');
+
+        const plan = buildMergePlan({
+          baseSnapshot,
+          local: localWorkspace.document,
+          incoming: remote.workspace.document,
+          source: 'tabsync'
+        });
+        const resolutions = autoResolutionsForTabSync(plan);
+        const mergedDocument = finalizeMerge(plan, resolutions, {
+          local: localWorkspace.document,
+          incoming: remote.workspace.document
+        });
+
+        const review: MergeReview = { plan, resolutions };
+        const existingReview = readReview();
+        if (existingReview && existingReview.plan.generatedAt > review.plan.generatedAt) {
+          setMergeReview(existingReview);
+        } else {
+          writeReview(plan.conflicts.length ? review : null);
+          setMergeReview(plan.conflicts.length ? review : null);
+        }
+
+        const nextWorkspace = toWorkspace(mergedDocument, localWorkspace);
+        nextWorkspace.dirty = false;
+        const revision = remote.revision + 1;
+        writeEnvelope(nextWorkspace, revision);
+        revisionRef.current = revision;
+        dispatch({ type: 'adopt', workspace: nextWorkspace, label: '已合并另一标签页的修改并保存' });
+        setRemoteNotice('');
+        setApiMessage(
+          plan.conflicts.length
+            ? `已保留对方修改并保存；${plan.conflicts.length} 处并列内容在“合并”标签页等你裁决`
+            : `${reason}：检测到另一标签页的修改，已自动合并双方内容`
+        );
+        return;
+      } catch (cause) {
+        // 合并不成功绝不覆盖：保留原草稿与待处理项
+        writeEnvelope(localWorkspace, revisionRef.current);
+        setApiMessage(`合并失败，未覆盖对方修改，原草稿已保留：${cause instanceof Error ? cause.message : '未知错误'}`);
+        return;
+      }
+    }
+
+    const revision = (remote?.revision ?? revisionRef.current) + 1;
+    writeEnvelope(localWorkspace, revision);
+    revisionRef.current = revision;
     setApiMessage(`${reason}已写入本地，模拟接口返回 200`);
     setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
+  }
+
+  /** 手动“合并并重载”：把另一标签页的保存合进当前工作区 */
+  async function mergeRemoteAndReload() {
+    const remote = readEnvelope().envelope;
+    if (!remote) {
+      setRemoteNotice('没有检测到另一标签页的保存内容。');
+      return;
+    }
+    await persistSnapshot('重载合并', workspaceRef.current!);
+  }
+
+  function startMergeReview(plan: MergePlan) {
+    const review: MergeReview = { plan, resolutions: {} };
+    setMergeReview(review);
+    writeReview(review);
+    setRightTab('merge');
+    setMergeNotice('已生成试合并结果；裁决前不会改动当前稿。');
+  }
+
+  function resolveMergeItem(conflictId: string, resolution: MergeResolution) {
+    setMergeReview((current) => {
+      if (!current) return current;
+      const next: MergeReview = { ...current, resolutions: { ...current.resolutions, [conflictId]: resolution } };
+      writeReview(next);
+      return next;
+    });
+  }
+
+  /** 确认合并：finalize 抛错时当前稿与待处理项原样不动 */
+  function confirmMerge() {
+    if (!mergeReview) return;
+    try {
+      const previousWorkspace = clone(workspaceRef.current!);
+      const incoming: TextDocument = {
+        ...previousWorkspace.document,
+        chapters: mergeReview.plan.incomingChapters,
+        snapshots: mergeReview.plan.incomingSnapshots,
+        annotations: []
+      };
+      const mergedDocument = finalizeMerge(mergeReview.plan, mergeReview.resolutions, {
+        local: previousWorkspace.document,
+        incoming
+      });
+
+      const confirmed = createConfirmedMerge(mergedDocument, mergeReview.plan, mergeReview.resolutions, {
+        workspace: previousWorkspace,
+        review: mergeReview
+      });
+      writeConfirmed(confirmed);
+      setConfirmedMergeState(confirmed);
+
+      const nextWorkspace = toWorkspace(mergedDocument, previousWorkspace);
+      nextWorkspace.dirty = false;
+      dispatch({ type: 'adopt', workspace: nextWorkspace, label: '离线合并已写入当前稿' });
+      writeReview(null);
+      setMergeReview(null);
+      setMergeNotice('合并结果经逐条确认后已写入；原草稿与待处理项已留存，可一键恢复。');
+    } catch (cause) {
+      setMergeNotice(`合并未写入：${cause instanceof Error ? cause.message : '未知错误'}。原草稿与待处理项未改动。`);
+    }
+  }
+
+  /** 恢复：合并、恢复、导出读取的是同一份确认结果，回滚其备份 */
+  function rollbackMerge() {
+    if (!confirmedMerge) return;
+    if (!window.confirm('恢复到合并前的原草稿，并还原当时的待处理项？')) return;
+    const backupWorkspace = clone(confirmedMerge.backup.workspace);
+    dispatch({ type: 'adopt', workspace: backupWorkspace, label: '已恢复合并前的原草稿与待处理项' });
+    if (confirmedMerge.backup.review) {
+      writeReview(confirmedMerge.backup.review);
+      setMergeReview(confirmedMerge.backup.review);
+    }
+    const revision = revisionRef.current + 1;
+    writeEnvelope(backupWorkspace, revision);
+    revisionRef.current = revision;
+    writeConfirmed(null);
+    setConfirmedMergeState(null);
+    setMergeNotice('已恢复原草稿和待处理项，可重新选择后再次确认。');
+  }
+
+  function discardMergeReview() {
+    if (!window.confirm('放弃本次试合并？原草稿不会改动。')) return;
+    writeReview(null);
+    setMergeReview(null);
+    setMergeNotice('');
+  }
+
+  /** 导出与恢复都读取已确认的合并结果；仍有待裁决项时禁止导出 */
+  function exportBlockedReason(): string {
+    if (mergeReview) {
+      const unresolved = mergeReview.plan.conflicts.filter((item) => !mergeReview.resolutions[item.id]).length;
+      if (unresolved) return `合并尚有 ${unresolved} 处并列内容未选择，确认前不能导出`;
+      return '合并结果尚未写入当前稿，请先在“合并”标签页确认';
+    }
+    return '';
   }
 
   function addAnnotation(values: Omit<Annotation, 'id' | 'status' | 'conflictState' | 'updatedAt'>) {
@@ -617,11 +829,23 @@ export function TextAnnotationWorkbench() {
   }, [document, leftVersionId, rightVersionId]);
 
   function exportJson() {
-    download(`${document.title}.json`, JSON.stringify(document, null, 2), 'application/json;charset=utf-8');
+    const reason = exportBlockedReason();
+    if (reason) {
+      setApiMessage(reason);
+      return;
+    }
+    const target = confirmedMerge?.document ?? document;
+    download(`${target.title}.json`, JSON.stringify(target, null, 2), 'application/json;charset=utf-8');
   }
 
   function exportHtml() {
-    download(`${document.title}.html`, buildHtml(document), 'text/html;charset=utf-8');
+    const reason = exportBlockedReason();
+    if (reason) {
+      setApiMessage(reason);
+      return;
+    }
+    const target = confirmedMerge?.document ?? document;
+    download(`${target.title}.html`, buildHtml(target), 'text/html;charset=utf-8');
   }
 
   const mode = workspace.mode;
@@ -691,6 +915,16 @@ export function TextAnnotationWorkbench() {
             <Kbd>/</Kbd><span>搜索</span>
           </span>
         </div>
+        {remoteNotice ? (
+          <div className="mx-auto flex max-w-[1800px] flex-wrap items-center gap-2 border-t border-amber-200 bg-amber-100/80 px-4 py-2 text-xs text-amber-900 lg:px-6">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            <span>{remoteNotice}</span>
+            <Button size="sm" color="warning" variant="solid" className="ml-auto" startContent={<RefreshCw className="h-3.5 w-3.5" />} onPress={() => void mergeRemoteAndReload()}>
+              合并并重载
+            </Button>
+            <Button size="sm" variant="light" onPress={() => setRemoteNotice('')}>忽略</Button>
+          </div>
+        ) : null}
       </header>
 
       <main className="mx-auto grid max-w-[1800px] grid-cols-1 gap-4 p-4 lg:grid-cols-[270px_minmax(0,1fr)_390px] lg:p-6">
@@ -1011,6 +1245,31 @@ export function TextAnnotationWorkbench() {
                   </ScrollShadow>
                 </Tab>
 
+                <Tab key="merge" title={
+                  <span className="flex items-center gap-1">
+                    <GitMerge className="h-3.5 w-3.5" />
+                    合并
+                    {mergeReview?.plan.conflicts.length ? (
+                      <span className="ml-0.5 rounded-full bg-red-500 px-1.5 text-[10px] font-bold leading-4 text-white">
+                        {mergeReview.plan.conflicts.filter((item) => !mergeReview.resolutions[item.id]).length}
+                      </span>
+                    ) : null}
+                  </span>
+                }>
+                  <MergePanel
+                    document={document}
+                    snapshots={document.snapshots}
+                    review={mergeReview}
+                    confirmed={confirmedMerge}
+                    notice={mergeNotice}
+                    onStart={startMergeReview}
+                    onResolve={resolveMergeItem}
+                    onConfirm={confirmMerge}
+                    onRollback={rollbackMerge}
+                    onDiscard={discardMergeReview}
+                  />
+                </Tab>
+
                 <Tab key="versions" title="版本">
                   <ScrollShadow className="max-h-[calc(100vh-210px)]">
                     <div className="space-y-4 pr-1">
@@ -1074,9 +1333,12 @@ export function TextAnnotationWorkbench() {
                       </div>
 
                       <Divider />
+                      {exportBlockedReason() ? (
+                        <p className="rounded-lg bg-red-50 px-3 py-2 text-[11px] leading-5 text-red-700">{exportBlockedReason()}</p>
+                      ) : null}
                       <div className="grid grid-cols-2 gap-2">
-                        <Button size="sm" variant="flat" onPress={exportHtml} startContent={<FileDown className="h-4 w-4" />}>导出 HTML</Button>
-                        <Button size="sm" variant="flat" onPress={exportJson} startContent={<FileJson className="h-4 w-4" />}>导出 JSON</Button>
+                        <Button size="sm" variant="flat" isDisabled={!!exportBlockedReason()} onPress={exportHtml} startContent={<FileDown className="h-4 w-4" />}>导出 HTML</Button>
+                        <Button size="sm" variant="flat" isDisabled={!!exportBlockedReason()} onPress={exportJson} startContent={<FileJson className="h-4 w-4" />}>导出 JSON</Button>
                       </div>
                       <p className="text-[11px] leading-5 text-stone-500">{apiMessage}</p>
                     </div>

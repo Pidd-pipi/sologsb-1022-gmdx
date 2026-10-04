@@ -93,3 +93,88 @@ export interface ConflictGroup {
   anchorLabel: string;
   annotations: Annotation[];
 }
+
+export type MergeSide = 'local' | 'incoming';
+export type MergeResolution = 'local' | 'incoming' | 'both' | 'keep' | 'delete';
+
+export interface MergeChange {
+  id: string;
+  tone: 'carry' | 'local' | 'incoming' | 'add-local' | 'add-incoming' | 'migrate' | 'delete' | 'conflict';
+  label: string;
+  detail: string;
+}
+
+export interface MergeConflict {
+  id: string;
+  type: 'annotation' | 'sentence-text' | 'delete-vs-edit' | 'same-id-different';
+  reason: string;
+  chapterId: string;
+  sentenceId?: string;
+  anchorLabel: string;
+  kind?: AnnotationKind;
+  localAnnotation?: Annotation;
+  incomingAnnotation?: Annotation;
+  localText?: string;
+  incomingText?: string;
+  keepAnnotation?: Annotation;
+  keepProvenance?: MergeSide;
+  deletedSide?: MergeSide;
+}
+
+export interface SentenceMergeState {
+  chapterId: string;
+  sentenceId: string;
+  baseText: string;
+  localText: string;
+  incomingText: string;
+  status: 'same' | 'local' | 'incoming' | 'conflict' | 'local-only' | 'incoming-only';
+  conflictId?: string;
+}
+
+export interface AcceptedAnnotation {
+  provenance: MergeSide;
+  annotation: Annotation;
+  migratedToSentence: boolean;
+  change: MergeChange;
+}
+
+export interface MergePlan {
+  baseSnapshotId: string;
+  baseLabel: string;
+  source: 'import' | 'tabsync';
+  generatedAt: string;
+  incomingTitle: string;
+  baseChapters: Chapter[];
+  localChapters: Chapter[];
+  incomingChapters: Chapter[];
+  incomingSnapshots: VersionSnapshot[];
+  mergedChapters: Chapter[];
+  sentenceStates: SentenceMergeState[];
+  accepted: AcceptedAnnotation[];
+  conflicts: MergeConflict[];
+  changes: MergeChange[];
+  idRewrites: [string, string][];
+}
+
+export interface MergeReview {
+  plan: MergePlan;
+  resolutions: Record<string, MergeResolution>;
+}
+
+export interface ConfirmedMerge {
+  id: string;
+  appliedAt: string;
+  source: MergePlan['source'];
+  changeCount: number;
+  conflictCount: number;
+  migratedCount: number;
+  document: TextDocument;
+  backup: { workspace: WorkspaceState; review: MergeReview | null };
+}
+
+export interface DraftEnvelope {
+  v: 2;
+  revision: number;
+  savedAt: string;
+  workspace: WorkspaceState;
+}

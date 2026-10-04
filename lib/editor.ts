@@ -47,6 +47,7 @@ function pushHistory(state: EditorState, next: WorkspaceState, label: string): E
 
 export type EditorAction =
   | { type: 'hydrate'; workspace: WorkspaceState }
+  | { type: 'adopt'; workspace: WorkspaceState; label: string }
   | { type: 'commit'; label: string; mutate: (document: TextDocument) => void }
   | { type: 'selectChapter'; chapterId: string }
   | { type: 'selectSentence'; chapterId: string; sentenceId: string }
@@ -64,6 +65,13 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         past: [],
         future: [],
         lastAction: '已恢复离线草稿'
+      };
+    case 'adopt':
+      return {
+        workspace: action.workspace,
+        past: [],
+        future: [],
+        lastAction: action.label
       };
     case 'commit': {
       const next = clone(state.workspace);
